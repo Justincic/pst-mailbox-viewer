@@ -1,6 +1,6 @@
 import { PSTFile } from "pst-parser";
 
-const APP_VERSION = "2.1.0";
+const APP_VERSION = "2.2.0";
 const PAGE_SIZE = 200;
 const DOM_PAGE_SIZE = 150;
 const folderCache = new WeakMap();
@@ -105,7 +105,9 @@ root.innerHTML = `
     .mail-body img { max-width: 100%; height: auto; }
     .mail-body pre { white-space: pre-wrap; font: inherit; }
     .attachments { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 30px 22px; }
-    .attachment { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; border: 1px solid #d9e1ea; border-radius: 8px; background: #f8fafc; font-size: 12px; }
+    .attachment { display: inline-flex; align-items: center; gap: 7px; padding: 8px 11px; border: 1px solid #d9e1ea; border-radius: 8px; color: #274665; background: #f8fafc; font-size: 12px; }
+    button.attachment:hover { border-color: #9bbddd; background: #edf6ff; }
+    button.attachment:disabled { cursor: not-allowed; color: #8a96a3; opacity: .7; }
     .busy { position: fixed; inset: 64px 0 0; z-index: 10; display: grid; place-items: center; color: #23476e; background: #f6f9fce8; backdrop-filter: blur(3px); }
     .spinner { width: 34px; height: 34px; margin: 0 auto 12px; border: 3px solid #d5e3f0; border-top-color: #2a78c5; border-radius: 50%; animation: spin .8s linear infinite; }
     .hidden { display: none !important; }
@@ -195,7 +197,7 @@ const CODEPAGE_ENCODINGS = {
   1251: "windows-1251", 1252: "windows-1252", 1253: "windows-1253",
   1254: "windows-1254", 1255: "windows-1255", 1256: "windows-1256",
   1257: "windows-1257", 1258: "windows-1258", 20127: "windows-1252",
-  28591: "iso-8859-1", 54936: "gb18030", 65001: "utf-8",
+  28591: "iso-8859-1", 50220: "iso-2022-jp", 54936: "gb18030", 65001: "utf-8",
 };
 
 function normalizeEncoding(value) {
@@ -217,7 +219,9 @@ function asBytes(value) {
 }
 
 function decodeScore(value) {
-  return (value.match(/�/g)?.length || 0) * 50
+  const knownHtmlTags = value.match(/<(?:!doctype|html|head|body|meta|style|div|span|p|table|tr|td|br|font|a)\b/gi)?.length || 0;
+  return (knownHtmlTags < 2 ? 100000 : 0)
+    + (value.match(/�/g)?.length || 0) * 50
     + (value.match(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g)?.length || 0) * 10
     + (value.match(/Ã.|Â.|â€|ðŸ|锟斤拷|嚙/g)?.length || 0) * 8;
 }
@@ -234,7 +238,9 @@ function decodeHtmlBody(properties, raw) {
     || asciiPreview.match(/<meta[^>]+content=["'][^"']*charset\s*=\s*([^\s;"']+)/i)?.[1]
     || get(properties, ["internetCharset"], "");
   const codepage = get(properties, ["internetCodepage", "messageCodepage"], "");
-  const preferred = normalizeEncoding(declaredCharset) || normalizeEncoding(codepage);
+  // Outlook's MAPI codepage describes the bytes stored in the PST and is more
+  // reliable here than old quoted HTML whose meta charset is sometimes stale.
+  const preferred = normalizeEncoding(codepage) || normalizeEncoding(declaredCharset);
   const candidates = [...new Set([preferred, "utf-8", "big5", "gb18030", "windows-1252"].filter(Boolean))];
   const decoded = [];
   for (const encoding of candidates) {
@@ -322,16 +328,35 @@ function renderFolder(folder, parent, open = false) {
 
 function messageFromPST(raw, folder, hydrated = true) {
   let properties = {};
-  try { properties = raw.getAllProperties?.() || {}; } catch { /* 保留可直接讀取的欄位 */ }
+  if (typeof raw.getProperty === "function") {
+    const readTag = (tag) => { try { return raw.getProperty(tag); } catch { return undefined; } };
+    properties = {
+      clientSubmitTime: readTag(0x0039), sentRepresentingName: readTag(0x0042),
+      sentRepresentingEmailAddress: readTag(0x0065), conversationTopic: readTag(0x0070),
+      transportMessageHeaders: readTag(0x007D), senderName: readTag(0x0C1A),
+      senderEmailAddress: readTag(0x0C1F), displayCc: readTag(0x0E03),
+      displayTo: readTag(0x0E04), messageDeliveryTime: readTag(0x0E06),
+      normalizedSubject: readTag(0x0E1D), creationTime: readTag(0x3007),
+      lastModificationTime: readTag(0x3008), internetCodepage: readTag(0x3FDE),
+      messageCodepage: readTag(0x3FFD), internetCharset: readTag(0x669A),
+      bodyHtml: get(raw, ["bodyHTMLBytes"], null), body: get(raw, ["body"], ""),
+    };
+  } else {
+    try { properties = raw.getAllProperties?.() || {}; } catch { /* 保留可直接讀取的欄位 */ }
+  }
   const value = (names, fallback = "") => get(raw, names, get(properties, names, fallback));
   let attachmentEntries = [];
-  try { attachmentEntries = raw.getAttachmentEntries?.() || []; } catch { /* 附件表可能損壞 */ }
+  let directAttachmentCount = Number(get(raw, ["attachmentCount"], 0)) || 0;
+  if (!directAttachmentCount) {
+    try { attachmentEntries = raw.getAttachmentEntries?.() || []; } catch { /* 附件表可能損壞 */ }
+    directAttachmentCount = attachmentEntries.length;
+  }
   const sender = text(value(["senderName", "sentRepresentingName", "senderEmailAddress", "sentRepresentingEmailAddress"], "未知寄件者"), "未知寄件者");
   const subject = text(value(["subject", "normalizedSubject", "conversationTopic"], "（無主旨）"), "（無主旨）");
   const plainBody = text(value(["body", "plainTextBody"], ""));
   const htmlBody = text(decodeHtmlBody(properties, raw));
   const date = value(["messageDeliveryTime", "clientSubmitTime", "creationTime", "lastModificationTime"], "");
-  const attachmentCount = attachmentEntries.length || Number(value(["numberOfAttachments", "attachmentCount"], 0)) || (value(["hasattach", "hasAttachments"], false) ? 1 : 0);
+  const attachmentCount = directAttachmentCount || Number(value(["numberOfAttachments", "attachmentCount"], 0)) || (value(["hasattach", "hasAttachments"], false) ? 1 : 0);
   return {
     raw,
     folder,
@@ -476,7 +501,7 @@ async function openMessage(mail) {
     } catch (error) {
       if (request !== state.messageRequest) return;
       console.error(error);
-      els.reader.innerHTML = `<div class="reader-empty">無法讀取這封郵件</div>`;
+      renderMessageError(mail);
       return;
     }
   }
@@ -484,17 +509,30 @@ async function openMessage(mail) {
   renderReader(mail);
 }
 
+function renderMessageError(mail) {
+  const senderLine = mail.senderEmail && !mail.sender.includes(mail.senderEmail)
+    ? `${escapeHTML(mail.sender)} &lt;${escapeHTML(mail.senderEmail)}&gt;`
+    : escapeHTML(mail.sender);
+  els.reader.innerHTML = `
+    <div class="reader-content">
+      <header class="mail-head">
+        <h1 class="mail-subject">${escapeHTML(mail.subject)}</h1>
+        <div class="mail-person">
+          <span class="avatar">${escapeHTML(initials(mail.sender))}</span>
+          <span><div class="mail-from">${senderLine}</div><div class="mail-to">這封郵件的基本資料仍可瀏覽</div></span>
+          <time class="mail-date">${escapeHTML(formatDate(mail.date))}</time>
+        </div>
+      </header>
+      <div class="reader-empty"><div class="empty-card"><h2>郵件內容無法復原</h2><p>這封郵件在 PST 裡的資料區塊已損壞，或使用目前解析器不支援的區塊格式。其他郵件不受影響。</p></div></div>
+    </div>`;
+}
+
 function getAttachments(mail) {
-  const list = [];
-  const count = mail.attachmentCount;
-  for (let index = 0; index < count; index += 1) {
-    try {
-      const attachment = mail.raw.getAttachment?.(index) || mail.attachmentEntries[index];
-      if (!attachment) continue;
-      list.push(text(get(attachment, ["attachLongFilename", "attachFilename", "longFilename", "filename", "displayName"], `附件 ${index + 1}`), `附件 ${index + 1}`));
-    } catch { /* 單一附件失敗不影響郵件內容 */ }
-  }
-  return list;
+  return attachmentObjects(mail).map((attachment, index) => ({
+    index,
+    name: text(get(attachment, ["attachLongFilename", "attachFilename", "longFilename", "filename", "displayName"], `附件 ${index + 1}`), `附件 ${index + 1}`),
+    available: Boolean(asBytes(get(attachment, ["attachDataBinary"], null))),
+  }));
 }
 
 function attachmentObjects(mail) {
@@ -502,9 +540,9 @@ function attachmentObjects(mail) {
   const objects = [];
   for (let index = 0; index < mail.attachmentCount; index += 1) {
     try {
-      const attachment = mail.raw.getAttachment?.(index) || mail.attachmentEntries[index];
-      if (attachment) objects.push(attachment);
-    } catch { /* 損壞的附件略過 */ }
+      const attachment = mail.raw.getAttachmentInfo?.(index) || mail.raw.getAttachment?.(index) || mail.attachmentEntries[index];
+      objects[index] = attachment || {};
+    } catch { objects[index] = {}; /* 無法匯出的附件仍保留位置與提示 */ }
   }
   mail.attachmentObjects = objects;
   return objects;
@@ -569,12 +607,26 @@ function renderReader(mail) {
       </header>
       ${hasRemoteImages && !mail.allowRemoteImages ? `<div class="mail-body-toolbar"><button class="remote-images" type="button">載入遠端圖片（可能連線至寄件者伺服器）</button></div>` : ""}
       <div class="mail-body">${safeHTML}</div>
-      ${attachments.length ? `<div class="attachments">${attachments.map((name) => `<span class="attachment">${icons.paperclip}${escapeHTML(name)}</span>`).join("")}</div>` : ""}
+      ${attachments.length ? `<div class="attachments">${attachments.map((attachment) => `<button class="attachment" type="button" data-attachment="${attachment.index}" ${attachment.available ? "" : "disabled title=\"此附件格式目前無法匯出\""}>${icons.paperclip}${escapeHTML(attachment.name)}</button>`).join("")}</div>` : ""}
     </div>`;
   els.reader.querySelector(".remote-images")?.addEventListener("click", () => {
     mail.allowRemoteImages = true;
     renderReader(mail);
   });
+  els.reader.querySelectorAll("[data-attachment]").forEach((button) => button.addEventListener("click", () => {
+    const index = Number(button.dataset.attachment);
+    const attachment = attachmentObjects(mail)[index];
+    const data = get(attachment, ["attachDataBinary"], null);
+    if (!asBytes(data)) return;
+    const filename = attachments[index]?.name || `附件-${index + 1}`;
+    const mime = text(get(attachment, ["attachMimeTag"], inferMime(filename)));
+    const url = URL.createObjectURL(new Blob([data], { type: mime }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }));
 }
 
 function sanitizeMailHTML(html, allowRemoteImages = false) {

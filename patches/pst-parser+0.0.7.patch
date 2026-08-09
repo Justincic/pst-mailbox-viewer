@@ -1,0 +1,45 @@
+diff --git a/node_modules/pst-parser/src/messaging/Message.js b/node_modules/pst-parser/src/messaging/Message.js
+index 8b4dafa..7b7c793 100644
+--- a/node_modules/pst-parser/src/messaging/Message.js
++++ b/node_modules/pst-parser/src/messaging/Message.js
+@@ -31,6 +31,17 @@ export class Message {
+         }
+     }
+
++    // Keep the original bytes available so callers can decode legacy Big5,
++    // GBK, Shift-JIS and other code pages without the lossy UTF-8 conversion.
++    get bodyHTMLBytes () {
++        const value = this.#pc.getValueByKey(Tags.PID_TAG_BODY_HTML);
++        return value instanceof DataView ? arrayBufferFromDataView(value) : value;
++    }
++
++    get attachmentCount () { return this.#attachments?.recordCount || 0; }
++
++    getProperty (tag) { return this.#pc.getValueByKey(tag); }
++
+     get hasAttachments () {
+         const flags = /** @type {number|undefined} */(this.#pc.getValueByKey(Tags.PID_TAG_MESSAGE_FLAGS));
+         if (typeof flags === "undefined") return;
+@@ -101,4 +112,22 @@ export class Message {
+         }
+
+     }
++
++    getAttachmentInfo (index) {
++        if (index < 0 || !this.#attachments || index >= this.#attachments.recordCount) return null;
++        const attachmentPCNid = this.#attachments.getCellValueByColumnTag(index, Tags.PID_TAG_LTP_ROW_ID);
++        if (typeof attachmentPCNid !== "number") return null;
++        const pc = this.#pstContext.getSubPropertyContext(attachmentPCNid);
++        if (!pc) throw Error("Unable to find Attachment PropertyContext");
++        const binary = pc.getValueByKey(Tags.PID_TAG_ATTACH_DATA_BINARY);
++        return {
++            attachDataBinary: binary instanceof DataView ? arrayBufferFromDataView(binary) : binary,
++            attachFilename: pc.getValueByKey(Tags.PID_TAG_ATTACH_FILENAME),
++            attachLongFilename: pc.getValueByKey(Tags.PID_TAG_ATTACH_LONG_FILENAME),
++            attachMimeTag: pc.getValueByKey(Tags.PID_TAG_ATTACH_MIME_TAG),
++            attachContentId: pc.getValueByKey(Tags.PID_TAG_ATTACH_CONTENT_ID),
++            attachContentLocation: pc.getValueByKey(Tags.PID_TAG_ATTACH_CONTENT_LOCATION),
++            attachContentDisposition: pc.getValueByKey(Tags.PID_TAG_ATTACH_CONTENT_DISPOSITION),
++        };
++    }
+ }
