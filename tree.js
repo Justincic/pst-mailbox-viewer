@@ -1,8 +1,10 @@
 import { PSTFile } from "pst-parser";
+import PostalMime from "postal-mime";
 
-const APP_VERSION = "2.2.0";
+const APP_VERSION = "2.2.1";
 const PAGE_SIZE = 200;
 const DOM_PAGE_SIZE = 150;
+const PREVIEW_HYDRATE_LIMIT = 100;
 const folderCache = new WeakMap();
 let activeObjectUrls = [];
 
@@ -376,16 +378,81 @@ function messageFromPST(raw, folder, hydrated = true) {
   };
 }
 
+const mailboxText = (address) => {
+  if (!address) return "";
+  if (Array.isArray(address.group)) return address.group.map(mailboxText).filter(Boolean).join(", ");
+  return address.name && address.address ? `${address.name} <${address.address}>` : text(address.address || address.name);
+};
+
+const addressListText = (addresses) => (addresses || []).map(mailboxText).filter(Boolean).join(", ");
+
+async function enrichEmbeddedEml(mail) {
+  if (mail.htmlBody || mail.plainBody) return mail;
+  const outerAttachments = attachmentObjects(mail);
+  const emlIndex = outerAttachments.findIndex((attachment, index) => {
+    const filename = text(get(attachment, ["attachLongFilename", "attachFilename"], `附件 ${index + 1}`));
+    const mime = text(get(attachment, ["attachMimeTag"], "")).toLowerCase();
+    return filename.toLowerCase().endsWith(".eml") || mime === "message/rfc822";
+  });
+  if (emlIndex < 0) return mail;
+  const emlBytes = asBytes(get(outerAttachments[emlIndex], ["attachDataBinary"], null));
+  if (!emlBytes?.byteLength) return mail;
+
+  try {
+    const parsed = await PostalMime.parse(emlBytes);
+    const parsedSender = mailboxText(parsed.from);
+    const parsedSenderEmail = text(parsed.from?.address);
+    const parsedAttachments = (parsed.attachments || []).map((attachment, index) => ({
+      attachDataBinary: attachment.content,
+      attachLongFilename: attachment.filename || `附件 ${index + 1}`,
+      attachMimeTag: attachment.mimeType,
+      attachContentId: attachment.contentId,
+      attachContentDisposition: attachment.disposition,
+    }));
+    Object.assign(mail, {
+      sender: parsedSender || mail.sender,
+      senderEmail: parsedSenderEmail || mail.senderEmail,
+      to: addressListText(parsed.to) || mail.to,
+      cc: addressListText(parsed.cc) || mail.cc,
+      subject: text(parsed.subject, mail.subject.replace(/\.eml$/i, "")),
+      plainBody: text(parsed.text),
+      htmlBody: text(parsed.html),
+      date: parsed.date || mail.date,
+      snippet: cleanBodyText(parsed.text || parsed.html || "").slice(0, 160),
+      attachmentCount: parsedAttachments.length,
+      attachmentObjects: parsedAttachments,
+      embeddedEml: true,
+    });
+  } catch (error) {
+    console.warn("無法解析內嵌 EML", error);
+  }
+  return mail;
+}
+
 const yieldToBrowser = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 async function readMessages(folder, onProgress = () => {}) {
   const count = Math.max(0, Number(get(folder, ["contentCount", "emailCount"], 0)) || 0);
+  const hydratePreviews = count <= PREVIEW_HYDRATE_LIMIT;
   const results = [];
   if (typeof folder.getContents === "function" && typeof folder.getMessage === "function") {
     for (let offset = 0; offset < count; offset += PAGE_SIZE) {
       const entries = folder.getContents(offset, Math.min(offset + PAGE_SIZE, count)) || [];
       for (const entry of entries) {
-        try { results.push(messageFromPST(entry, folder, false)); } catch { /* 非郵件項目略過 */ }
+        try {
+          const metadata = messageFromPST(entry, folder, false);
+          if (!hydratePreviews) {
+            results.push(metadata);
+            continue;
+          }
+          try {
+            const fullMessage = messageFromPST(folder.getMessage(entry.nid), folder, true);
+            await enrichEmbeddedEml(fullMessage);
+            results.push({ ...fullMessage, nid: entry.nid });
+          } catch {
+            results.push(metadata); // 保留損壞郵件的基本資料
+          }
+        } catch { /* 非郵件項目略過 */ }
       }
       onProgress(results.length, count);
       await yieldToBrowser();
@@ -463,7 +530,7 @@ function renderMessages() {
     button.className = "message-row";
     button.innerHTML = `
       <span class="avatar">${escapeHTML(initials(mail.sender))}</span>
-      <span class="message-main"><span class="sender">${escapeHTML(mail.sender)}</span><span class="subject">${escapeHTML(mail.subject)}</span><span class="snippet">${escapeHTML(mail.snippet || "沒有預覽內容")}</span></span>
+      <span class="message-main"><span class="sender">${escapeHTML(mail.sender)}</span><span class="subject">${escapeHTML(mail.subject)}</span><span class="snippet">${escapeHTML(mail.snippet || (mail.hydrated ? "郵件沒有文字內文" : "點擊查看郵件內容"))}</span></span>
       <span class="message-side"><span>${escapeHTML(formatDate(mail.date, true))}</span>${mail.attachmentCount ? icons.paperclip : ""}</span>`;
     button.addEventListener("click", async () => {
       root.querySelectorAll(".message-row.active").forEach((node) => node.classList.remove("active"));
@@ -497,6 +564,7 @@ async function openMessage(mail) {
     try {
       const raw = mail.folder.getMessage(mail.nid);
       const fullMail = messageFromPST(raw, mail.folder, true);
+      await enrichEmbeddedEml(fullMail);
       Object.assign(mail, fullMail, { nid: mail.nid, hydrated: true });
     } catch (error) {
       if (request !== state.messageRequest) return;

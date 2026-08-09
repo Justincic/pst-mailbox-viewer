@@ -1,7 +1,7 @@
 {
   "name": "pst-mailbox-viewer",
   "private": true,
-  "version": "2.2.0",
+  "version": "2.2.1",
   "type": "module",
   "scripts": {
     "postinstall": "patch-package",
@@ -10,6 +10,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "postal-mime": "^2.7.6",
     "pst-parser": "^0.0.7"
   },
   "devDependencies": {
