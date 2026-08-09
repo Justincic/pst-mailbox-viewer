@@ -1,6 +1,8 @@
 import { PSTFile } from "pst-parser";
 
-const PAGE_SIZE = 80;
+const PAGE_SIZE = 200;
+const DOM_PAGE_SIZE = 150;
+const folderCache = new WeakMap();
 
 const icons = {
   mail: `<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2Zm0 3.2 8 5 8-5V7l-8 5-8-5v1.2Z"/></svg>`,
@@ -17,6 +19,9 @@ const state = {
   selectedMessage: null,
   messages: [],
   filter: "",
+  visibleCount: DOM_PAGE_SIZE,
+  folderRequest: 0,
+  messageRequest: 0,
 };
 
 const root = document.querySelector("#pst-mailbox");
@@ -73,6 +78,8 @@ root.innerHTML = `
     .snippet { display: block; margin-top: 3px; color: #8894a1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .message-side { display: flex; flex-direction: column; align-items: flex-end; gap: 7px; color: #7b8794; font-size: 11px; }
     .message-side svg { width: 14px; height: 14px; }
+    .load-more { width: calc(100% - 28px); margin: 14px; padding: 10px; border: 1px solid #d7e0ea; border-radius: 8px; color: #25649e; background: #f7faff; font-weight: 700; }
+    .load-more:hover { background: #edf5ff; }
     .reader { display: flex; flex-direction: column; background: #fff; }
     .reader-empty, .empty { height: 100%; display: grid; place-items: center; padding: 35px; color: #768494; text-align: center; }
     .empty-card { max-width: 390px; }
@@ -102,7 +109,7 @@ root.innerHTML = `
   <main class="app">
     <header class="topbar">
       <div class="brand"><span class="brand-badge">${icons.mail}</span><span>PST 信箱瀏覽器</span></div>
-      <label class="search">${icons.search}<input id="mail-search" type="search" placeholder="搜尋寄件者、主旨或內文" disabled /></label>
+      <label class="search">${icons.search}<input id="mail-search" type="search" placeholder="搜尋寄件者或主旨" disabled /></label>
       <button class="import" id="import-pst" type="button">${icons.file}<span>開啟 PST</span></button>
       <input id="pst-input" type="file" accept=".pst,application/vnd.ms-outlook" hidden />
     </header>
@@ -207,26 +214,35 @@ function getSubfolders(folder) {
 
 function renderFolder(folder, parent, open = false) {
   const info = folderInfo(folder);
-  const subfolders = getSubfolders(folder);
+  const hasChildren = Boolean(get(folder, ["hasSubfolders"], false));
   const li = document.createElement("li");
   const button = document.createElement("button");
   button.type = "button";
   button.className = "folder-row";
   button.setAttribute("aria-expanded", String(open));
-  button.innerHTML = `<span class="chevron">${subfolders.length ? "›" : ""}</span>${icons.folder}<span class="name">${escapeHTML(info.name)}</span><span class="count">${info.count || ""}</span>`;
+  button.innerHTML = `<span class="chevron">${hasChildren ? "›" : ""}</span>${icons.folder}<span class="name">${escapeHTML(info.name)}</span><span class="count">${info.count || ""}</span>`;
   li.append(button);
 
   let childList = null;
-  if (subfolders.length) {
+  let childrenLoaded = false;
+  const loadChildren = () => {
+    if (!childList || childrenLoaded) return;
+    childrenLoaded = true;
+    const subfolders = getSubfolders(folder);
+    subfolders.forEach((child) => renderFolder(child, childList));
+    if (!subfolders.length) button.querySelector(".chevron").textContent = "";
+  };
+  if (hasChildren) {
     childList = document.createElement("ul");
     childList.className = "tree-list";
     childList.hidden = !open;
-    subfolders.forEach((child) => renderFolder(child, childList));
     li.append(childList);
+    if (open) loadChildren();
   }
 
   button.addEventListener("click", async () => {
     if (childList) {
+      loadChildren();
       const expanded = button.getAttribute("aria-expanded") === "true";
       button.setAttribute("aria-expanded", String(!expanded));
       childList.hidden = expanded;
@@ -239,7 +255,7 @@ function renderFolder(folder, parent, open = false) {
   return button;
 }
 
-function messageFromPST(raw, folder) {
+function messageFromPST(raw, folder, hydrated = true) {
   let properties = {};
   try { properties = raw.getAllProperties?.() || {}; } catch { /* 保留可直接讀取的欄位 */ }
   const value = (names, fallback = "") => get(raw, names, get(properties, names, fallback));
@@ -250,10 +266,12 @@ function messageFromPST(raw, folder) {
   const plainBody = text(value(["body", "plainTextBody"], ""));
   const htmlBody = text(value(["bodyHTML", "htmlBody"], ""));
   const date = value(["messageDeliveryTime", "clientSubmitTime", "creationTime", "lastModificationTime"], "");
-  const attachmentCount = attachmentEntries.length || Number(value(["numberOfAttachments", "attachmentCount"], 0)) || 0;
+  const attachmentCount = attachmentEntries.length || Number(value(["numberOfAttachments", "attachmentCount"], 0)) || (value(["hasattach", "hasAttachments"], false) ? 1 : 0);
   return {
     raw,
     folder,
+    nid: Number(value(["nid"], 0)) || 0,
+    hydrated,
     attachmentEntries,
     sender,
     senderEmail: text(value(["senderEmailAddress", "sentRepresentingEmailAddress"], "")),
@@ -268,15 +286,19 @@ function messageFromPST(raw, folder) {
   };
 }
 
-function readMessages(folder) {
+const yieldToBrowser = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+async function readMessages(folder, onProgress = () => {}) {
   const count = Math.max(0, Number(get(folder, ["contentCount", "emailCount"], 0)) || 0);
   const results = [];
   if (typeof folder.getContents === "function" && typeof folder.getMessage === "function") {
     for (let offset = 0; offset < count; offset += PAGE_SIZE) {
       const entries = folder.getContents(offset, Math.min(offset + PAGE_SIZE, count)) || [];
       for (const entry of entries) {
-        try { results.push(messageFromPST(folder.getMessage(entry.nid), folder)); } catch { /* 非郵件項目略過 */ }
+        try { results.push(messageFromPST(entry, folder, false)); } catch { /* 非郵件項目略過 */ }
       }
+      onProgress(results.length, count);
+      await yieldToBrowser();
     }
     return results;
   }
@@ -289,24 +311,46 @@ function readMessages(folder) {
         if (!child) break;
         results.push(messageFromPST(child, folder));
       } catch { /* 損壞或不支援的項目略過 */ }
+      if (i > 0 && i % PAGE_SIZE === 0) {
+        onProgress(results.length, count);
+        await yieldToBrowser();
+      }
     }
   }
   return results;
 }
 
 async function selectFolder(folder) {
+  const request = ++state.folderRequest;
+  state.messageRequest += 1;
   state.selectedFolder = folder;
   state.selectedMessage = null;
+  state.visibleCount = DOM_PAGE_SIZE;
   const info = folderInfo(folder);
   els.folderTitle.textContent = info.name;
   els.reader.innerHTML = `<div class="reader-empty">選擇一封郵件以查看內容</div>`;
-  setBusy(true, `正在讀取「${info.name}」…`);
-  await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  els.mailCount.textContent = info.count ? `${info.count.toLocaleString("zh-TW")} 封` : "0 封";
+  els.messageList.innerHTML = `<div class="reader-empty">正在載入郵件清單…</div>`;
+  await yieldToBrowser();
   try {
-    state.messages = readMessages(folder).sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
+    let messagesPromise = folderCache.get(folder);
+    if (!messagesPromise) {
+      messagesPromise = readMessages(folder, (loaded, total) => {
+        if (request === state.folderRequest) {
+          els.messageList.innerHTML = `<div class="reader-empty">正在載入郵件清單… ${loaded.toLocaleString("zh-TW")} / ${total.toLocaleString("zh-TW")}</div>`;
+        }
+      }).then((messages) => messages.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0)));
+      folderCache.set(folder, messagesPromise);
+    }
+    const messages = await messagesPromise;
+    if (request !== state.folderRequest) return;
+    state.messages = messages;
     renderMessages();
-  } finally {
-    setBusy(false);
+  } catch (error) {
+    folderCache.delete(folder);
+    if (request !== state.folderRequest) return;
+    console.error(error);
+    els.messageList.innerHTML = `<div class="reader-empty">無法讀取這個資料夾</div>`;
   }
 }
 
@@ -315,6 +359,7 @@ function renderMessages() {
   const messages = query
     ? state.messages.filter((mail) => `${mail.sender} ${mail.senderEmail} ${mail.subject} ${mail.snippet}`.toLocaleLowerCase("zh-TW").includes(query))
     : state.messages;
+  const visibleMessages = messages.slice(0, state.visibleCount);
   els.mailCount.textContent = `${messages.length.toLocaleString("zh-TW")} 封`;
   els.messageList.replaceChildren();
   if (!messages.length) {
@@ -322,7 +367,7 @@ function renderMessages() {
     return;
   }
   const fragment = document.createDocumentFragment();
-  messages.forEach((mail) => {
+  visibleMessages.forEach((mail) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "message-row";
@@ -330,15 +375,48 @@ function renderMessages() {
       <span class="avatar">${escapeHTML(initials(mail.sender))}</span>
       <span class="message-main"><span class="sender">${escapeHTML(mail.sender)}</span><span class="subject">${escapeHTML(mail.subject)}</span><span class="snippet">${escapeHTML(mail.snippet || "沒有預覽內容")}</span></span>
       <span class="message-side"><span>${escapeHTML(formatDate(mail.date, true))}</span>${mail.attachmentCount ? icons.paperclip : ""}</span>`;
-    button.addEventListener("click", () => {
+    button.addEventListener("click", async () => {
       root.querySelectorAll(".message-row.active").forEach((node) => node.classList.remove("active"));
       button.classList.add("active");
-      state.selectedMessage = mail;
-      renderReader(mail);
+      await openMessage(mail);
     });
     fragment.append(button);
   });
   els.messageList.append(fragment);
+  if (visibleMessages.length < messages.length) {
+    const loadMore = document.createElement("button");
+    loadMore.type = "button";
+    loadMore.className = "load-more";
+    loadMore.textContent = `顯示更多（尚有 ${(messages.length - visibleMessages.length).toLocaleString("zh-TW")} 封）`;
+    loadMore.addEventListener("click", () => {
+      const scrollTop = els.messageList.scrollTop;
+      state.visibleCount += DOM_PAGE_SIZE;
+      renderMessages();
+      els.messageList.scrollTop = scrollTop;
+    });
+    els.messageList.append(loadMore);
+  }
+}
+
+async function openMessage(mail) {
+  const request = ++state.messageRequest;
+  state.selectedMessage = mail;
+  if (!mail.hydrated) {
+    els.reader.innerHTML = `<div class="reader-empty">正在讀取郵件內容…</div>`;
+    await yieldToBrowser();
+    try {
+      const raw = mail.folder.getMessage(mail.nid);
+      const fullMail = messageFromPST(raw, mail.folder, true);
+      Object.assign(mail, fullMail, { nid: mail.nid, hydrated: true });
+    } catch (error) {
+      if (request !== state.messageRequest) return;
+      console.error(error);
+      els.reader.innerHTML = `<div class="reader-empty">無法讀取這封郵件</div>`;
+      return;
+    }
+  }
+  if (request !== state.messageRequest) return;
+  renderReader(mail);
 }
 
 function getAttachments(mail) {
@@ -415,6 +493,9 @@ async function openPST(file) {
     state.pst = pst;
     state.messages = [];
     state.filter = "";
+    state.visibleCount = DOM_PAGE_SIZE;
+    state.folderRequest += 1;
+    state.messageRequest += 1;
     els.fileName.textContent = file.name;
     els.search.value = "";
     els.search.disabled = false;
@@ -436,6 +517,7 @@ els.importButton.addEventListener("click", () => els.input.click());
 els.input.addEventListener("change", () => openPST(els.input.files?.[0]));
 els.search.addEventListener("input", () => {
   state.filter = els.search.value.trim();
+  state.visibleCount = DOM_PAGE_SIZE;
   renderMessages();
 });
 
