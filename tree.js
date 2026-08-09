@@ -1,5 +1,6 @@
 import { PSTFile } from "pst-parser";
 
+const APP_VERSION = "2.0.0";
 const PAGE_SIZE = 200;
 const DOM_PAGE_SIZE = 150;
 const folderCache = new WeakMap();
@@ -38,6 +39,7 @@ root.innerHTML = `
     .app { height: 100vh; min-height: 620px; display: grid; grid-template-rows: 64px 1fr; overflow: hidden; }
     .topbar { display: flex; align-items: center; gap: 22px; padding: 0 22px; color: white; background: linear-gradient(100deg, #172b4d, #284c7e); box-shadow: 0 2px 14px #12284a2e; z-index: 3; }
     .brand { display: flex; align-items: center; gap: 11px; font-weight: 750; letter-spacing: .2px; white-space: nowrap; }
+    .version { padding: 3px 7px; border: 1px solid #ffffff35; border-radius: 999px; color: #dcecff; background: #ffffff12; font-size: 10px; font-weight: 750; letter-spacing: .4px; }
     .brand-badge { display: grid; place-items: center; width: 36px; height: 36px; border-radius: 10px; background: #57b7ff; box-shadow: inset 0 0 0 1px #fff4; }
     .brand-badge svg { width: 22px; height: 22px; }
     .search { margin-left: auto; width: min(420px, 38vw); height: 38px; display: flex; align-items: center; gap: 9px; padding: 0 12px; border-radius: 9px; background: #ffffff18; border: 1px solid #ffffff25; }
@@ -108,7 +110,7 @@ root.innerHTML = `
   </style>
   <main class="app">
     <header class="topbar">
-      <div class="brand"><span class="brand-badge">${icons.mail}</span><span>PST 信箱瀏覽器</span></div>
+      <div class="brand"><span class="brand-badge">${icons.mail}</span><span>PST 信箱瀏覽器</span><span class="version" title="目前版本">v${APP_VERSION}</span></div>
       <label class="search">${icons.search}<input id="mail-search" type="search" placeholder="搜尋寄件者或主旨" disabled /></label>
       <button class="import" id="import-pst" type="button">${icons.file}<span>開啟 PST</span></button>
       <input id="pst-input" type="file" accept=".pst,application/vnd.ms-outlook" hidden />
